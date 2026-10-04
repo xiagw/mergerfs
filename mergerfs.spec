@@ -13,6 +13,8 @@ BuildRequires:	gcc-c++
 # rpmbuild driven by the Makefile uses git to generate a version number
 BuildRequires:	git
 
+Requires:	python3
+
 %global debug_package %{nil}
 %undefine _debuginfo_subpackages
 %global _enable_debug_packages 0
@@ -36,6 +38,15 @@ make install PREFIX=%{_prefix} DESTDIR=%{buildroot}
 /usr/bin/mergerfs-fusermount
 /usr/bin/fsck.mergerfs
 /usr/bin/mergerfs.collect-info
+/usr/bin/mergerfs-tools
+/usr/bin/auto_mount.sh
+/usr/bin/mergerfs.balance
+/usr/bin/mergerfs.consolidate
+/usr/bin/mergerfs.ctl
+/usr/bin/mergerfs.dedup
+/usr/bin/mergerfs.dup
+/usr/bin/mergerfs.fsck
+/usr/bin/mergerfs.mktrash
 /sbin/mount.mergerfs
 /usr/lib/mergerfs/preload.so
 %doc %{_mandir}/*

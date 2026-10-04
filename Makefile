@@ -249,8 +249,19 @@ ifdef GIT_REPO
 	$(GIT) clean -xfd
 endif
 
+TOOLS_BINS := \
+	tools/auto_mount.sh \
+	tools/mergerfs.balance \
+	tools/mergerfs.consolidate \
+	tools/mergerfs.ctl \
+	tools/mergerfs.dedup \
+	tools/mergerfs.dup \
+	tools/mergerfs.fsck \
+	tools/mergerfs.mktrash \
+	tools/mergerfs-tools
+
 .PHONY: install
-install: install-base install-mount-tools install-preload install-man
+install: install-base install-mount-tools install-preload install-man install-tools
 
 .PHONY: install-base
 install-base: all
@@ -274,12 +285,17 @@ install-preload: preload
 	$(MKDIR) -p "$(INSTALLLIBDIR)"
 	$(INSTALL) -v -m 444 "$(BUILDDIR)/preload.so" "$(INSTALLLIBDIR)/preload.so"
 
+.PHONY: install-tools
+install-tools:
+	$(MKDIR) -p "$(INSTALLBINDIR)"
+	$(INSTALL) -v -m 0755 $(TOOLS_BINS) "$(INSTALLBINDIR)"
+
 .PHONY: install-strip
 install-strip: install-base
 	$(STRIP) "$(INSTALLBINDIR)/mergerfs"
 
 .PHONY: uninstall
-uninstall: uninstall-base uninstall-mount.mergerfs uninstall-preload uninstall-man
+uninstall: uninstall-base uninstall-mount.mergerfs uninstall-preload uninstall-man uninstall-tools
 
 uninstall-base:
 	$(RM) -f "$(INSTALLBINDIR)/mergerfs"
@@ -294,6 +310,9 @@ uninstall-man:
 
 uninstall-preload:
 	$(RM) -f "$(INSTALLLIBDIR)/preload.so"
+
+uninstall-tools:
+	$(RM) -f $(addprefix $(INSTALLBINDIR)/,$(notdir $(TOOLS_BINS)))
 
 .PHONY: tarball
 tarball: changelog version

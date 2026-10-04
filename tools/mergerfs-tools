@@ -1,0 +1,556 @@
+#!/bin/bash
+
+# mergerfs-tools: unified front-end for the standalone mergerfs helper scripts.
+#
+# Thin wrapper only. It exposes ONE new option vocabulary (all long options
+# except -n/-v/-h) and translates internally to whatever the sibling scripts
+# expect. The user never types an underlying script's original flags.
+#
+# Filters: --include/--exclude are the only filter options. Before dispatch the
+# wrapper validates them against the target directory:
+#   * literal values (no glob) are probed; a missing path is an error, and the
+#     value is routed as file or directory according to what exists;
+#   * glob values (containing * ? [) cannot be probed and are handed to every
+#     matcher the command supports;
+#   * combinations the underlying script cannot honour (dup/dedup with a '/'
+#     path, dup given a directory, consolidate given a file, balance asked to
+#     exclude a directory by name) are rejected up front.
+#
+# Execution: data-changing commands execute by default; --dry-run previews.
+# fsck audits unless --fix is given. ctl and balance have no preview mode.
+
+readonly PROG=${0##*/}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
+
+usage() {
+    cat <<EOF
+用法: ${PROG} <命令> [选项] <目录>
+
+mergerfs 辅助工具的统一入口。所有选项都是本工具自定义的，底层各脚本的
+原始参数由本工具内部翻译，你无需了解。
+
+命令:
+  ctl add|remove|list|get|set|info   操作运行中的 mergerfs 挂载
+  fsck                               审计/修复文件的权限与属主
+  dup                                在分支间复制文件，使每个文件有 N 份
+  dedup                              删除分支间的重复文件
+  balance                            按剩余空间在分支间搬移文件
+  consolidate                        把单个目录的文件归拢到一个分支
+  trash                              在每个分支创建 .Trash 目录
+  vacate <pool> <branch>             安全下架分支：移出池并把数据复制进池
+
+通用选项:
+  -n, --dry-run        只预览，不执行
+  -v, --verbose        提高输出详细度（可重复）
+  -h, --help           显示本帮助
+  --include GLOB       包含匹配的文件/目录/路径（可重复）
+  --exclude GLOB       排除匹配的文件/目录/路径（可重复）
+
+各命令专属选项:
+  ctl            --mount PATH
+  fsck           --fix manual|newest|nonroot    --check-size
+  dup            --copies N    --keep MODE    --prune
+  dedup          --keep MODE   --ignore COND  --strict
+  balance        --free-gap PCT   --min-size SZ   --max-size SZ
+  consolidate    --dir-max-files N   --dir-max-size SZ
+
+取值:
+  --keep    manual | oldest | newest | largest | smallest | most-space | mergerfs
+            （dup 不支持 manual、most-space）
+  --ignore  none | same-size | different-size | same-time | different-time |
+            same-hash | different-hash | same-short-hash | different-short-hash
+  SIZE      整数 + K/M/G/T，例如 16G
+
+过滤参数的处理（执行前校验）:
+  目标目录必须存在，否则报错。
+  不含通配符的值会在目标目录下探测：不存在则报错；存在则按文件/目录分派，
+  底层无法处理的组合直接报错（如 dup 给目录、consolidate 给文件、
+  balance 按目录名排除、dup/dedup 的值里带 '/'）。
+  含通配符（* ? [）的值无法预先探测，交由底层匹配器处理。
+
+说明:
+  会改动数据的命令默认直接执行，加 --dry-run 只预览。
+  fsck 只有给出 --fix 才修复，否则只审计。
+  vacate 只复制、从不删除源数据。
+  ctl 的写操作立即生效，不支持 --dry-run；balance 没有预览模式。
+
+示例:
+  # 预览去重：保留最新文件，并排除 .git 目录
+  ${PROG} dedup --dry-run --keep newest --exclude .git /neo
+
+  # 实际去重：只处理 .mkv，且要求内容 md5 相同
+  ${PROG} dedup --include '*.mkv' --ignore same-hash /neo
+
+  # 复制文件，使每个文件至少有两份
+  ${PROG} dup --copies 2 /neo
+
+  # 审计某目录的权限/属主不一致
+  ${PROG} fsck --verbose /neo/media
+
+  # 把各分支的使用率差距压到 5% 以内
+  ${PROG} balance --free-gap 5 /neo
+
+  # 把某目录的文件归拢到单个分支（先预览）
+  ${PROG} consolidate --dry-run /neo/music
+
+  # 操作运行中的挂载：添加 / 移除分支
+  ${PROG} ctl --mount /neo add path /media/xx/disk3
+  ${PROG} ctl --mount /neo remove path /media/xx/disk3
+
+  # 查看挂载信息
+  ${PROG} ctl --mount /neo info
+  ${PROG} ctl --mount /neo list values
+
+  # 在各分支创建 .Trash 目录（需要 root）
+  sudo ${PROG} trash /neo
+
+  # 下架 /media/xx/disk3：先预览，确认后去掉 --dry-run 执行
+  ${PROG} vacate --dry-run /neo /media/xx/disk3
+  ${PROG} vacate /neo /media/xx/disk3
+EOF
+}
+
+die() {
+    echo "${PROG}: $1" >&2
+    exit 2
+}
+
+die_missing() {
+    die "$1 requires an argument"
+}
+
+run_tool() {
+    local tool=$1
+    shift
+    local path="${SCRIPT_DIR}/${tool}"
+    if [ ! -x "${path}" ]; then
+        die "cannot find executable: ${path}"
+    fi
+    exec "${path}" "$@"
+}
+
+require_dir() {
+    [ -d "$1" ] || die "not a directory: $1"
+}
+
+# Reject common options a command cannot honour.
+# Usage: reject_common <command> [allowed letters among: n v I E]
+reject_common() {
+    local cmd=$1
+    local allowed=" $2 "
+    if [ ${dry} -ne 0 ] && [[ ${allowed} != *" n "* ]]; then
+        die "${cmd}: --dry-run is not supported"
+    fi
+    if [ ${verbose} -ne 0 ] && [[ ${allowed} != *" v "* ]]; then
+        die "${cmd}: --verbose is not supported"
+    fi
+    if [ ${#includes[@]} -ne 0 ] && [[ ${allowed} != *" I "* ]]; then
+        die "${cmd}: --include is not supported"
+    fi
+    if [ ${#excludes[@]} -ne 0 ] && [[ ${allowed} != *" E "* ]]; then
+        die "${cmd}: --exclude is not supported"
+    fi
+}
+
+keep_value() {
+    case $1 in
+        most-space) printf '%s' mostfreespace ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+validate_keep() {
+    case $1:$2 in
+        dup:newest|dup:oldest|dup:smallest|dup:largest|dup:mergerfs) ;;
+        dedup:manual|dedup:oldest|dedup:newest|dedup:smallest|dedup:largest|dedup:most-space|dedup:mergerfs) ;;
+        *) die "$1: --keep $2 is not supported" ;;
+    esac
+}
+
+ignore_value() {
+    case $1 in
+        none) printf '' ;;
+        same-size) printf '%s' same-size ;;
+        different-size) printf '%s' diff-size ;;
+        same-time) printf '%s' same-time ;;
+        different-time) printf '%s' diff-time ;;
+        same-hash) printf '%s' same-hash ;;
+        different-hash) printf '%s' diff-hash ;;
+        same-short-hash) printf '%s' same-short-hash ;;
+        different-short-hash) printf '%s' diff-short-hash ;;
+    esac
+}
+
+validate_ignore() {
+    case $1 in
+        none|same-size|different-size|same-time|different-time|same-hash|different-hash|same-short-hash|different-short-hash) ;;
+        *) die "dedup: --ignore $1 is not supported" ;;
+    esac
+}
+
+# True when the value contains shell glob metacharacters.
+has_glob() {
+    case $1 in
+        *'*'*|*'?'*|*'['*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Print dir|file|missing for <root>/<value> (absolute values are used as-is).
+probe_type() {
+    local root=$1 pat=$2 candidate
+    case ${pat} in
+        /*) candidate=${pat} ;;
+        *) candidate="${root}/${pat}" ;;
+    esac
+    if [ -d "${candidate}" ]; then
+        printf '%s' dir
+    elif [ -e "${candidate}" ] || [ -L "${candidate}" ]; then
+        printf '%s' file
+    else
+        printf '%s' missing
+    fi
+}
+
+# Append one validated --include/--exclude value to filter_args, or die.
+emit_filter() {
+    local cmd=$1 kind=$2 root=$3 pat=$4 cls=$5
+    local domain inc=0
+    case ${kind} in include) inc=1 ;; esac
+
+    # Only basename patterns can reach dup/dedup; reject path patterns up front.
+    case ${cmd} in
+        dup|dedup)
+            case ${pat} in
+                */*) die "${cmd}: --${kind} does not support path patterns: ${pat}" ;;
+            esac
+            ;;
+    esac
+
+    case ${cmd} in
+        dup)
+            case ${cls} in
+                glob|file)
+                    if [ ${inc} -eq 1 ]; then filter_args+=(-I "${pat}"); else filter_args+=(-E "${pat}"); fi
+                    ;;
+                dir) die "dup cannot target a directory with --${kind}: ${pat}" ;;
+                missing) die "no such file or directory under ${root}: ${pat}" ;;
+            esac
+            ;;
+        dedup)
+            case ${cls} in
+                glob|file)
+                    if [ ${inc} -eq 1 ]; then filter_args+=(-I "${pat}"); else filter_args+=(-E "${pat}"); fi
+                    ;;
+                dir)
+                    if [ ${inc} -eq 1 ]; then
+                        die "dedup cannot include a directory with --include: ${pat}"
+                    fi
+                    filter_args+=(-E "${pat}" -D "${pat}")
+                    ;;
+                missing) die "no such file or directory under ${root}: ${pat}" ;;
+            esac
+            ;;
+        balance)
+            case ${cls} in
+                file) domain="basename" ;;
+                dir) die "balance cannot exclude a directory by name: ${pat} (use a path glob such as '*/${pat}/*')" ;;
+                missing) die "no such file or directory under ${root}: ${pat}" ;;
+                glob)
+                    case ${pat} in */*) domain="path" ;; *) domain="basename" ;; esac
+                    ;;
+            esac
+            if [ ${inc} -eq 1 ]; then
+                if [ "${domain}" = path ]; then filter_args+=(-I "${pat}"); else filter_args+=(-i "${pat}"); fi
+            else
+                if [ "${domain}" = path ]; then filter_args+=(-E "${pat}"); else filter_args+=(-e "${pat}"); fi
+            fi
+            ;;
+        consolidate)
+            case ${cls} in
+                file) die "consolidate only filters directories, not files: ${pat}" ;;
+                missing) die "no such file or directory under ${root}: ${pat}" ;;
+                dir|glob)
+                    if [ ${inc} -eq 1 ]; then filter_args+=(-I "${pat}"); else filter_args+=(-E "${pat}"); fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# Validate --include/--exclude for the command and populate filter_args.
+build_filters() {
+    local cmd=$1 root=$2 p
+    filter_args=()
+    case ${cmd} in
+        fsck|ctl|trash|vacate) return 0 ;;
+    esac
+    for p in "${includes[@]}"; do
+        if has_glob "${p}"; then
+            emit_filter "${cmd}" include "${root}" "${p}" glob
+        else
+            emit_filter "${cmd}" include "${root}" "${p}" "$(probe_type "${root}" "${p}")"
+        fi
+    done
+    for p in "${excludes[@]}"; do
+        if has_glob "${p}"; then
+            emit_filter "${cmd}" exclude "${root}" "${p}" glob
+        else
+            emit_filter "${cmd}" exclude "${root}" "${p}" "$(probe_type "${root}" "${p}")"
+        fi
+    done
+}
+
+cmd_ctl() {
+    reject_common ctl
+    local final=()
+    local arg
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --mount) shift; [ $# -gt 0 ] || die_missing --mount; final+=(-m "$1") ;;
+            --mount=*) final+=(-m "${arg#--mount=}") ;;
+            -*) die "ctl: unknown option: ${arg}" ;;
+            *) final+=("${arg}") ;;
+        esac
+        shift
+    done
+    run_tool mergerfs.ctl "${final[@]}"
+}
+
+cmd_trash() {
+    reject_common trash
+    if [ $# -ne 1 ]; then
+        die "trash requires exactly one <pool>"
+    fi
+    run_tool mergerfs.mktrash "$1"
+}
+
+cmd_dup() {
+    reject_common dup "n I E"
+    local final=() pos=()
+    local arg
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --copies) shift; [ $# -gt 0 ] || die_missing --copies; final+=(-c "$1") ;;
+            --copies=*) final+=(-c "${arg#--copies=}") ;;
+            --keep) shift; [ $# -gt 0 ] || die_missing --keep; validate_keep dup "$1"; final+=(-d "$(keep_value "$1")") ;;
+            --keep=*) validate_keep dup "${arg#--keep=}"; final+=(-d "$(keep_value "${arg#--keep=}")") ;;
+            --prune) final+=(-p) ;;
+            -*) die "dup: unknown option: ${arg}" ;;
+            *) pos+=("${arg}") ;;
+        esac
+        shift
+    done
+    [ ${#pos[@]} -ge 1 ] || die "dup requires <dir>"
+    require_dir "${pos[0]}"
+    build_filters dup "${pos[0]}"
+    final=("${filter_args[@]}" "${final[@]}")
+    if [ ${dry} -eq 0 ]; then final+=(-e); fi
+    run_tool mergerfs.dup "${final[@]}" "${pos[@]}"
+}
+
+cmd_dedup() {
+    reject_common dedup "n v I E"
+    local final=() pos=()
+    local arg i v
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --keep) shift; [ $# -gt 0 ] || die_missing --keep; validate_keep dedup "$1"; final+=(-d "$(keep_value "$1")") ;;
+            --keep=*) validate_keep dedup "${arg#--keep=}"; final+=(-d "$(keep_value "${arg#--keep=}")") ;;
+            --ignore) shift; [ $# -gt 0 ] || die_missing --ignore; validate_ignore "$1"; v=$(ignore_value "$1"); if [ -n "${v}" ]; then final+=(-i "${v}"); fi ;;
+            --ignore=*) validate_ignore "${arg#--ignore=}"; v=$(ignore_value "${arg#--ignore=}"); if [ -n "${v}" ]; then final+=(-i "${v}"); fi ;;
+            --strict) final+=(-s) ;;
+            -*) die "dedup: unknown option: ${arg}" ;;
+            *) pos+=("${arg}") ;;
+        esac
+        shift
+    done
+    [ ${#pos[@]} -ge 1 ] || die "dedup requires <dir>"
+    require_dir "${pos[0]}"
+    build_filters dedup "${pos[0]}"
+    final=("${filter_args[@]}" "${final[@]}")
+    for ((i = 0; i < verbose; i++)); do final+=(-v); done
+    if [ ${dry} -eq 0 ]; then final+=(-e); fi
+    run_tool mergerfs.dedup "${final[@]}" "${pos[@]}"
+}
+
+cmd_balance() {
+    reject_common balance "I E"
+    local final=() pos=()
+    local arg
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --free-gap) shift; [ $# -gt 0 ] || die_missing --free-gap; final+=(-p "$1") ;;
+            --free-gap=*) final+=(-p "${arg#--free-gap=}") ;;
+            --min-size) shift; [ $# -gt 0 ] || die_missing --min-size; final+=(-s "$1") ;;
+            --min-size=*) final+=(-s "${arg#--min-size=}") ;;
+            --max-size) shift; [ $# -gt 0 ] || die_missing --max-size; final+=(-S "$1") ;;
+            --max-size=*) final+=(-S "${arg#--max-size=}") ;;
+            -*) die "balance: unknown option: ${arg}" ;;
+            *) pos+=("${arg}") ;;
+        esac
+        shift
+    done
+    [ ${#pos[@]} -ge 1 ] || die "balance requires <dir>"
+    require_dir "${pos[0]}"
+    build_filters balance "${pos[0]}"
+    final=("${filter_args[@]}" "${final[@]}")
+    run_tool mergerfs.balance "${final[@]}" "${pos[@]}"
+}
+
+cmd_consolidate() {
+    reject_common consolidate "n I E"
+    local final=() pos=()
+    local arg
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --dir-max-files) shift; [ $# -gt 0 ] || die_missing --dir-max-files; final+=(-m "$1") ;;
+            --dir-max-files=*) final+=(-m "${arg#--dir-max-files=}") ;;
+            --dir-max-size) shift; [ $# -gt 0 ] || die_missing --dir-max-size; final+=(-M "$1") ;;
+            --dir-max-size=*) final+=(-M "${arg#--dir-max-size=}") ;;
+            -*) die "consolidate: unknown option: ${arg}" ;;
+            *) pos+=("${arg}") ;;
+        esac
+        shift
+    done
+    [ ${#pos[@]} -ge 1 ] || die "consolidate requires <dir>"
+    require_dir "${pos[0]}"
+    build_filters consolidate "${pos[0]}"
+    final=("${filter_args[@]}" "${final[@]}")
+    if [ ${dry} -eq 0 ]; then final+=(-e); fi
+    run_tool mergerfs.consolidate "${final[@]}" "${pos[@]}"
+}
+
+cmd_fsck() {
+    reject_common fsck "n v"
+    local final=() pos=()
+    local arg fix=0
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --fix) shift; [ $# -gt 0 ] || die_missing --fix; final+=(-f "$1"); fix=1 ;;
+            --fix=*) final+=(-f "${arg#--fix=}"); fix=1 ;;
+            --check-size) final+=(-s) ;;
+            -*) die "fsck: unknown option: ${arg}" ;;
+            *) pos+=("${arg}") ;;
+        esac
+        shift
+    done
+    [ ${#pos[@]} -ge 1 ] || die "fsck requires <dir>"
+    require_dir "${pos[0]}"
+    if [ ${dry} -ne 0 ] && [ ${fix} -ne 0 ]; then
+        die "fsck: cannot combine --dry-run with --fix"
+    fi
+    if [ ${verbose} -gt 0 ]; then final+=(-v); fi
+    run_tool mergerfs.fsck "${final[@]}" "${pos[@]}"
+}
+
+cmd_vacate() {
+    reject_common vacate "n"
+    if [ $# -ne 2 ]; then
+        die "vacate requires: <pool> <branch>"
+    fi
+    local pool=${1%/}
+    local branch=${2%/}
+    require_dir "${pool}"
+    require_dir "${branch}"
+
+    local ctl="${SCRIPT_DIR}/mergerfs.ctl"
+    [ -x "${ctl}" ] || die "cannot find executable: ${ctl}"
+    local remove_args=(-m "${pool}" remove path "${branch}")
+    local rsync_args=(-avHAXWE --ignore-existing --progress --relative
+                      "${branch}/./" "${pool}/")
+
+    if [ ${dry} -ne 0 ]; then
+        echo "# 预览（去掉 --dry-run 执行）:"
+        printf '%q' "${ctl}"; printf ' %q' "${remove_args[@]}"; echo
+        printf '%q' rsync; printf ' %q' "${rsync_args[@]}"; echo
+        return 0
+    fi
+
+    command -v rsync >/dev/null 2>&1 || die "rsync not found"
+    echo "# 从池移除分支: ${branch}"
+    "${ctl}" "${remove_args[@]}" || die "ctl remove failed"
+    echo "# 复制 ${branch} 的数据到 ${pool}（源不删除，已存在则跳过）"
+    rsync "${rsync_args[@]}" || die "rsync failed"
+    echo "# 完成。核对 ${pool} 无误后再清空/拔除 ${branch}。"
+    echo "# 分支当前为已移除状态；如需恢复: ${PROG} ctl --mount ${pool} add path ${branch}"
+}
+
+main() {
+    if [ $# -eq 0 ]; then
+        usage
+        exit 0
+    fi
+
+    cmd=$1
+    case ${cmd} in
+        -h|--help|help) usage; exit 0 ;;
+        ctl|fsck|dup|dedup|balance|consolidate|trash|vacate) ;;
+        *) die "unknown command: ${cmd}" ;;
+    esac
+    shift
+
+    dry=0
+    verbose=0
+    includes=()
+    excludes=()
+    rest=()
+
+    local arg
+    while [ $# -gt 0 ]; do
+        arg=$1
+        case ${arg} in
+            --)
+                shift
+                rest+=("$@")
+                break
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -n|--dry-run)
+                dry=1
+                ;;
+            -v|--verbose)
+                verbose=$((verbose + 1))
+                ;;
+            --include)
+                shift
+                [ $# -gt 0 ] || die_missing --include
+                includes+=("$1")
+                ;;
+            --include=*) includes+=("${arg#--include=}") ;;
+            --exclude)
+                shift
+                [ $# -gt 0 ] || die_missing --exclude
+                excludes+=("$1")
+                ;;
+            --exclude=*) excludes+=("${arg#--exclude=}") ;;
+            *)
+                rest+=("${arg}")
+                ;;
+        esac
+        shift
+    done
+
+    case ${cmd} in
+        ctl)         cmd_ctl "${rest[@]}" ;;
+        fsck)        cmd_fsck "${rest[@]}" ;;
+        dup)         cmd_dup "${rest[@]}" ;;
+        dedup)       cmd_dedup "${rest[@]}" ;;
+        balance)     cmd_balance "${rest[@]}" ;;
+        consolidate) cmd_consolidate "${rest[@]}" ;;
+        trash)       cmd_trash "${rest[@]}" ;;
+        vacate)      cmd_vacate "${rest[@]}" ;;
+    esac
+}
+
+main "$@"
