@@ -1,8 +1,11 @@
 #!/bin/bash
 
-# 挂载所有未挂载的独立文件系统；多设备 btrfs 卷
-# 成员盘共享 label 和 UUID，内核挂载表只记一个成员，按 UUID 判断是否已挂
-# 并按 UUID 去重，避免同一卷被挂多次（Thunar 出现 HD1T 和 HD1T1）
+# 挂载未挂载的独立文件系统；多设备 btrfs 卷
+# 设备发现完全依赖 /dev/disk/by-label/*：前提是文件系统必须有 label，
+# 无 label 的盘会被直接忽略（多设备 btrfs 也必须整卷有 label）。
+# 挂载与 mergerfs 池接受任意有 label 的可挂载 fs；snap 子命令仅 btrfs。
+# 多设备 btrfs 成员盘共享 label 和 UUID，内核挂载表只记一个成员，
+# 按 UUID 判断是否已挂并按 UUID 去重，避免同一卷被挂多次（Thunar 出现 HD1T 和 HD1T1）
 mount_unmounted_disks() {
     # 用户不在 plugdev 组时 udisksctl mount 会要密码，免密挂载失效
     if ! groups | grep -q '\bplugdev\b'; then
@@ -104,9 +107,56 @@ mount_mergerfs_pool() {
     fi
 }
 
-# 列出某 label 盘的快照；不传 label 则遍历所有已挂载的 btrfs 数据盘
+# 已挂载的 btrfs 数据盘 label 清单，一行一个，fzf 选盘的数据源
+btrfs_labels() {
+    local label_path LABEL fstype_target
+
+    for label_path in /dev/disk/by-label/*; do
+        [ -b "${label_path}" ] || continue
+        LABEL=$(basename "${label_path}")
+        # 未挂载则 findmnt 无输出；FSTYPE 是最后一列
+        fstype_target=$(findmnt -rn -S "LABEL=${LABEL}" -o TARGET,FSTYPE 2>/dev/null)
+        [ -n "${fstype_target}" ] || continue
+        [ "${fstype_target##* }" = "btrfs" ] || continue
+        printf '%s\n' "${LABEL}"
+    done
+}
+
+# 缺 LABEL 参数时用 fzf 交互选盘；stdout 只出选中的 LABEL，错误走 stderr
+# 取消、无 fzf、无 TTY（fzf 打不开 /dev/tty）都返回 1
+pick_label() {
+    local selected
+
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "❌ 未安装 fzf，请显式传 LABEL。" >&2
+        return 1
+    fi
+
+    selected=$(btrfs_labels | fzf --prompt='盘> ' --height=40% --reverse --exit-0) || {
+        echo "❌ 未选择盘。" >&2
+        return 1
+    }
+    if [ -z "${selected}" ]; then
+        echo "❌ 未选择盘。" >&2
+        return 1
+    fi
+    printf '%s\n' "${selected}"
+}
+
+# 某盘 .snapshots/ 下的快照相对路径，一行一个，fzf 选快照的数据源；无输出即无快照
+# btrfs subvolume list 走 TREE_SEARCH ioctl，非 root 必 EPERM，必须 sudo -n
+snapshot_rels() {
+    local LABEL="$1" target
+
+    target=$(findmnt -rn -S "LABEL=${LABEL}" -o TARGET 2>/dev/null)
+    [ -n "${target}" ] || return 1
+
+    sudo -n btrfs subvolume list -s "${target}" 2>/dev/null \
+        | awk -F'path ' 'index($2, ".snapshots/")==1 {print $2}'
+}
+
+# 列出某 label 盘的快照；filter 为空则遍历所有已挂载的 btrfs 数据盘
 # 快照固定放 <挂载点>/.snapshots/，只认这个前缀；返回 0 表示有结果、1 表示无
-# 需要 sudo -n 免密：btrfs subvolume list 走 TREE_SEARCH ioctl，非 root 必 EPERM
 list_snapshots() {
     local filter="${1:-}"
     local label_path LABEL target rel creation flags
@@ -138,8 +188,7 @@ list_snapshots() {
             flags=$(sudo -n btrfs subvolume show "${target}/${rel}" 2>/dev/null \
                 | sed -n 's/^[[:space:]]*Flags:[[:space:]]*//p')
             printf '%-10s %-45s %s  [%s]\n' "${LABEL}" "${rel}" "${creation:-?}" "${flags:--}"
-        done < <(sudo -n btrfs subvolume list -s "${target}" 2>/dev/null \
-            | awk -F'path ' 'index($2, ".snapshots/")==1 {print $2}')
+        done < <(snapshot_rels "${LABEL}")
     done
 
     if [ "${matched}" -eq 0 ]; then
@@ -148,12 +197,29 @@ list_snapshots() {
     fi
 }
 
+# snap get 的入口：all=列全部盘，缺参 fzf 选盘，其余按 LABEL 直接列
+get_snapshots() {
+    local LABEL="${1:-}"
+
+    if [ -z "${LABEL}" ]; then
+        LABEL=$(pick_label) || return 1
+    fi
+    if [ "${LABEL}" = "all" ]; then
+        list_snapshots ""
+    else
+        list_snapshots "${LABEL}"
+    fi
+}
+
 # 给指定 label 盘的整盘根子卷建只读快照，落盘到 <挂载点>/.snapshots/<label>_<时间>
 # 目标必须在同一文件系统内，只能放盘内部；快照内会看到一个空的 .snapshots 目录
 # （btrfs 快照不递归嵌套子卷），属正常现象。挂载点属主是当前用户，mkdir 无需 sudo
 create_snapshot() {
-    local LABEL="${1:?用法: $0 snap-create <LABEL>}"
-    local label_path target dest name
+    local LABEL="${1:-}" label_path target dest name
+
+    if [ -z "${LABEL}" ]; then
+        LABEL=$(pick_label) || return 1
+    fi
 
     label_path="/dev/disk/by-label/${LABEL}"
     if [ ! -b "${label_path}" ]; then
@@ -187,6 +253,53 @@ create_snapshot() {
     fi
 }
 
+# 删除指定盘上的一个快照；缺 LABEL 时 fzf 选盘，快照一律 fzf 选，删除前必须回车确认
+# 非 root 删子卷要挂载选项 user_subvol_rm_allowed（本机 udisks 挂载没有），必 EPERM
+delete_snapshot() {
+    local LABEL="${1:-}" target rel answer
+
+    if [ -z "${LABEL}" ]; then
+        LABEL=$(pick_label) || return 1
+    fi
+
+    target=$(findmnt -rn -S "LABEL=${LABEL}" -o TARGET 2>/dev/null)
+    if [ -z "${target}" ]; then
+        echo "❌ ${LABEL} 未挂载。"
+        return 1
+    fi
+    if [ "$(findmnt -rn -S "LABEL=${LABEL}" -o FSTYPE 2>/dev/null)" != "btrfs" ]; then
+        echo "❌ ${LABEL} 不是 btrfs，无快照可删。"
+        return 1
+    fi
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "❌ 未安装 fzf，无法选快照。" >&2
+        return 1
+    fi
+
+    rel=$(snapshot_rels "${LABEL}" | fzf --prompt='快照> ' --height=40% --reverse --exit-0) || {
+        echo "❌ 未选择快照。"
+        return 1
+    }
+    if [ -z "${rel}" ]; then
+        echo "❌ ${LABEL} 没有可删除的快照。"
+        return 1
+    fi
+
+    printf '即将删除 %s/%s\n' "${target}" "${rel}"
+    read -r -p "确认删除？输入 y 回车执行，其它任意取消：" answer
+    if [ "${answer}" != "y" ]; then
+        echo "已取消。"
+        return 1
+    fi
+
+    if sudo -n btrfs subvolume delete "${target}/${rel}"; then
+        echo "✅ 已删除 ${rel}"
+    else
+        echo "❌ 删除失败（确认 sudo -n 免密可用）。"
+        return 1
+    fi
+}
+
 # 已运行则跳过；首次启动 kodi 可能较慢，错误不中断主流程
 start_kodi() {
     if ! command -v kodi >/dev/null 2>&1; then
@@ -206,9 +319,10 @@ start_kodi() {
 usage() {
     cat <<EOF
 用法: $0 [命令]
-  （无参数）        挂载所有硬盘 + 挂载 mergerfs 池 + 启动 kodi
-  snap-list [LABEL] 列出快照（不传 LABEL 列全部盘）
-  snap-create LABEL  给 LABEL 盘建只读快照
+  （无参数）          挂载所有硬盘 + 挂载 mergerfs 池 + 启动 kodi
+  snap get [LABEL|all] 列快照；缺 LABEL 用 fzf 选盘，all=全部盘
+  snap add [LABEL]     建只读快照；缺 LABEL 用 fzf 选盘
+  snap del [LABEL]     删快照；缺 LABEL 用 fzf 选盘，再 fzf 选快照
 EOF
 }
 
@@ -218,11 +332,22 @@ case "${1:-}" in
         mount_mergerfs_pool
         start_kodi
         ;;
-    snap-list)
-        list_snapshots "${2:-}"
-        ;;
-    snap-create)
-        create_snapshot "${2:-}"
+    snap)
+        case "${2:-}" in
+            get)
+                get_snapshots "${3:-}"
+                ;;
+            add)
+                create_snapshot "${3:-}"
+                ;;
+            del)
+                delete_snapshot "${3:-}"
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
         ;;
     *)
         usage
