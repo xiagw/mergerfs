@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
 # 挂载未挂载的独立文件系统；多设备 btrfs 卷
 # 设备发现完全依赖 /dev/disk/by-label/*：前提是文件系统必须有 label，
@@ -17,8 +18,8 @@ mount_unmounted_disks() {
 
     local mounted_uuids label_path LABEL real_dev UUID FSTYPE
     local -A seen_uuid
-
-    mounted_uuids=$(findmnt -rn -o UUID 2>/dev/null)
+    ## 结果需要去掉空行
+    mounted_uuids=$(findmnt -rn -o UUID  2>/dev/null | grep -v '^$')
 
     for label_path in /dev/disk/by-label/*; do
         # 确保该路径是个合法的块设备，防止空目录报错
@@ -59,10 +60,10 @@ mount_unmounted_disks() {
     echo "所有可用硬盘动态挂载完毕！"
 }
 
-# 把所有已挂载的带 label 文件系统合并到 /neo（含机械盘）；
+# 把所有已挂载的带 label 文件系统合并到 /aio（含机械盘）；
 # 不依赖 label 命名；不写 fstab，由本脚本负责挂载，已挂载则跳过
 mount_mergerfs_pool() {
-    local POOL="/neo"
+    local POOL="/aio"
     local MERGERFS_OPTS="cache.files=off,category.create=pfrd,func.getattr=newest,dropcacheonclose=false,allow_other"
     local label_path LABEL real_dev FSTYPE target branch_str
     local -a branches=()
@@ -313,7 +314,7 @@ start_kodi() {
     fi
 
     echo "⚡ 注意：首次启动 Kodi 可能需要一些时间，请耐心等待..."
-    nohup kodi --audio-backend=alsa >/dev/null 2>&1 &
+    nohup kodi --audio-backend=alsa --device=dri >/tmp/nohup.kodi.log 2>&1 &
 }
 
 usage() {
